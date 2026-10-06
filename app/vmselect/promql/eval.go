@@ -1846,18 +1846,9 @@ func evalRollupFuncNoCache(qt *querytracer.Tracer, ec *EvalConfig, funcName stri
 	// Verify timeseries fit available memory during rollup calculations.
 	timeseriesLen := rssLen
 	if iafc != nil {
-		// Incremental aggregates require holding only GOMAXPROCS timeseries in memory.
+		// Reserve the rollup working set here. Aggregate groups are accounted for
+		// as they are created, since their number isn't known in advance.
 		timeseriesLen = cgroup.AvailableCPUs()
-		if iafc.ae.Modifier.Op != "" {
-			if iafc.ae.Limit > 0 {
-				// There is an explicit limit on the number of output time series.
-				timeseriesLen *= iafc.ae.Limit
-			} else {
-				// Increase the number of timeseries for non-empty group list: `aggr() by (something)`,
-				// since each group can have own set of time series in memory.
-				timeseriesLen *= 1000
-			}
-		}
 		// The maximum number of output time series is limited by rssLen.
 		if timeseriesLen > rssLen {
 			timeseriesLen = rssLen
@@ -1900,7 +1891,29 @@ func evalRollupFuncNoCache(qt *querytracer.Tracer, ec *EvalConfig, funcName stri
 	// Evaluate rollup
 	keepMetricNames := getKeepMetricNames(expr)
 	if iafc != nil {
-		return evalRollupWithIncrementalAggregate(ec.Context, qt, funcName, keepMetricNames, iafc, rss, rcs, preFunc, sharedTimestamps)
+		iafc.rollupMemoryLimiter = rml
+		iafc.memoryLimiter.MaxSize = math.MaxUint64
+		if maxMemory := int64(maxMemoryPerQuery.N); maxMemory > 0 {
+			iafc.memoryLimiter.MaxSize = uint64(maxMemory - rollupMemorySize)
+		}
+		// RunParallel waits for all workers before returning, so it is safe to
+		// release their state and memory reservations on success or failure.
+		defer iafc.resetState()
+		tss, err := evalRollupWithIncrementalAggregate(ec.Context, qt, funcName, keepMetricNames, iafc, rss, rcs, preFunc, sharedTimestamps)
+		memoryUsage := sumNoOverflow(rollupMemorySize, int64(iafc.memoryLimiter.usage))
+		// Account for dynamically allocated groups, including on evaluation errors,
+		// unless the initial rollup estimate has already logged this query.
+		if maxMemory := int64(logQueryMemoryUsage.N); maxMemory > 0 && rollupMemorySize <= maxMemory && memoryUsage > maxMemory {
+			memoryIntensiveQueries.Inc()
+			requestURI := ec.GetRequestURI()
+			logger.Warnf("remoteAddr=%s, requestURI=%s: the %s requires %d bytes of memory for processing; "+
+				"logging this query, since it exceeds the -search.logQueryMemoryUsage=%d; "+
+				"the query selects %d time series and generates %d points across all the time series; try reducing the number of selected time series",
+				ec.QuotedRemoteAddr, requestURI, expr.AppendString(nil), memoryUsage, maxMemory, timeseriesLen*len(rcs), rollupPoints)
+		}
+		qs.addMemoryUsage(memoryUsage)
+		qt.Printf("the rollup with incremental aggregation used an estimated %d bytes of RAM", memoryUsage)
+		return tss, err
 	}
 	return evalRollupNoIncrementalAggregate(ec.Context, qt, funcName, keepMetricNames, rss, rcs, preFunc, sharedTimestamps)
 }
@@ -1941,7 +1954,9 @@ func evalRollupWithIncrementalAggregate(ctx context.Context, qt *querytracer.Tra
 			if tsm := newTimeseriesMap(funcName, keepMetricNames, sharedTimestamps, &rs.MetricName); tsm != nil {
 				samplesScanned := rc.DoTimeseriesMap(tsm, rs.Values, rs.Timestamps)
 				for _, ts := range tsm.m {
-					iafc.updateTimeseries(ts, workerID)
+					if err := iafc.updateTimeseries(ts, workerID); err != nil {
+						return err
+					}
 				}
 				samplesScannedTotal.Add(samplesScanned)
 				continue
@@ -1949,7 +1964,11 @@ func evalRollupWithIncrementalAggregate(ctx context.Context, qt *querytracer.Tra
 			ts.Reset()
 			samplesScanned := doRollupForTimeseries(funcName, keepMetricNames, rc, ts, &rs.MetricName, rs.Values, rs.Timestamps, sharedTimestamps)
 			samplesScannedTotal.Add(samplesScanned)
-			iafc.updateTimeseries(ts, workerID)
+			if err := iafc.updateTimeseries(ts, workerID); err != nil {
+				// Don't return the shared timestamps to the timeseries pool.
+				ts.Timestamps = nil
+				return err
+			}
 
 			// ts.Timestamps points to sharedTimestamps. Zero it, so it can be reused.
 			ts.Timestamps = nil

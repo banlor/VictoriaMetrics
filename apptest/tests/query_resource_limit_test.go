@@ -1,7 +1,10 @@
 package tests
 
 import (
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -9,6 +12,157 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/apptest"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 )
+
+func TestSingleGroupedAggregationMaxMemoryPerQuery(t *testing.T) {
+	// Make the old fixed estimate of 1,000 groups deterministic.
+	t.Setenv("GOMAXPROCS", "1")
+	cli := apptest.NewClient()
+	defer cli.CloseConnections()
+	dir := t.TempDir()
+
+	const seriesCount = 2500
+	const pointsCount = 61
+	const start = 1652169600
+	samples := make([]string, 0, seriesCount*pointsCount)
+	for pod := range seriesCount {
+		for point := range pointsCount {
+			samples = append(samples, fmt.Sprintf(`grouped_memory{pod="%d",resource="memory"} 1 %d`, pod, (start+point*60)*1000))
+		}
+	}
+	opts := apptest.QueryOpts{
+		Start:   fmt.Sprint(start),
+		End:     fmt.Sprint(start + (pointsCount-1)*60),
+		Step:    "60s",
+		NoCache: "1",
+	}
+	query := `sum(max by (pod) (grouped_memory{resource="memory"}))`
+	for _, budget := range []string{"3MiB", "16MiB"} {
+		t.Run(budget, func(t *testing.T) {
+			vm, err := apptest.StartVmsingle("vmsingle-"+budget, []string{
+				"-storageDataPath=" + dir + "/" + budget,
+				"-retentionPeriod=100y",
+				"-search.maxMemoryPerQuery=" + budget,
+			}, cli, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer vm.Stop()
+			vm.PrometheusAPIV1ImportPrometheus(t, samples, apptest.QueryOpts{})
+			vm.ForceFlush(t)
+			res := vm.PrometheusAPIV1QueryRange(t, query, opts)
+			if budget == "3MiB" {
+				if res.ErrorType != "422" || !strings.Contains(res.Error, "-search.maxMemoryPerQuery") {
+					t.Fatalf("expected memory limit error; got status=%q, errorType=%q, error=%q", res.Status, res.ErrorType, res.Error)
+				}
+				t.Logf("grouped aggregation rejected: %s", res.Error)
+			} else {
+				if res.Status != "success" || len(res.Data.Result) != 1 || len(res.Data.Result[0].Samples) != pointsCount {
+					t.Fatalf("unexpected grouped aggregation result: %+v", res)
+				}
+				for _, sample := range res.Data.Result[0].Samples {
+					if sample.Value != seriesCount {
+						t.Fatalf("unexpected sum: got %g; want %d", sample.Value, seriesCount)
+					}
+				}
+			}
+			for _, query := range []string{
+				"sum(max by (resource) (grouped_memory))",
+				"sum(max without (pod) (grouped_memory))",
+				"sum(max by (pod) (grouped_memory) limit 1)",
+			} {
+				res = vm.PrometheusAPIV1QueryRange(t, query, opts)
+				if res.Status != "success" || len(res.Data.Result) != 1 || len(res.Data.Result[0].Samples) != pointsCount {
+					t.Fatalf("unexpected result for %s: %+v", query, res)
+				}
+				for _, sample := range res.Data.Result[0].Samples {
+					if sample.Value != 1 {
+						t.Fatalf("unexpected value for %s: got %g; want 1", query, sample.Value)
+					}
+				}
+			}
+			// The input cardinality alone must not reject an aggregation with few groups.
+			// Run repeatedly after a rejected query to catch leaked reservations.
+			for range 3 {
+				res = vm.PrometheusAPIV1QueryRange(t, "sum(grouped_memory)", opts)
+				if res.Status != "success" || len(res.Data.Result) != 1 || len(res.Data.Result[0].Samples) != pointsCount {
+					t.Fatalf("unexpected ungrouped aggregation result: %+v", res)
+				}
+				for _, sample := range res.Data.Result[0].Samples {
+					if sample.Value != seriesCount {
+						t.Fatalf("unexpected sum: got %g; want %d", sample.Value, seriesCount)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestSingleGroupedAggregationLogQueryMemoryUsage(t *testing.T) {
+	// Keep the initial rollup estimate below the dynamic-state logging threshold.
+	t.Setenv("GOMAXPROCS", "1")
+	cli := apptest.NewClient()
+	defer cli.CloseConnections()
+	dir := t.TempDir()
+
+	const seriesCount = 100
+	const pointsCount = 61
+	const start = 1652169600
+	samples := make([]string, 0, seriesCount*pointsCount)
+	for pod := range seriesCount {
+		for point := range pointsCount {
+			samples = append(samples, fmt.Sprintf(`logged_groups{pod="%d"} 1 %d`, pod, (start+point*60)*1000))
+		}
+	}
+	opts := apptest.QueryOpts{
+		Start:   fmt.Sprint(start),
+		End:     fmt.Sprint(start + (pointsCount-1)*60),
+		Step:    "60s",
+		NoCache: "1",
+	}
+	for _, tt := range []struct {
+		name         string
+		logThreshold string
+		memoryLimit  string
+		wantError    bool
+		wantLogged   float64
+	}{
+		{name: "dynamic_state", logThreshold: "64KiB", memoryLimit: "1MiB", wantLogged: 1},
+		{name: "dynamic_state_error", logThreshold: "64KiB", memoryLimit: "128KiB", wantError: true, wantLogged: 1},
+		{name: "initial_and_dynamic_state", logThreshold: "1KiB", memoryLimit: "1MiB", wantLogged: 1},
+		{name: "initial_estimate_error", logThreshold: "1KiB", memoryLimit: "1KiB", wantError: true, wantLogged: 1},
+		{name: "below_threshold", logThreshold: "1MiB", memoryLimit: "1MiB"},
+		{name: "disabled", logThreshold: "0", memoryLimit: "1MiB"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			vm, err := apptest.StartVmsingle("vmsingle-"+tt.name, []string{
+				"-storageDataPath=" + dir + "/" + tt.name,
+				"-retentionPeriod=100y",
+				"-search.logQueryMemoryUsage=" + tt.logThreshold,
+				"-search.maxMemoryPerQuery=" + tt.memoryLimit,
+			}, cli, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer vm.Stop()
+			vm.PrometheusAPIV1ImportPrometheus(t, samples, apptest.QueryOpts{})
+			vm.ForceFlush(t)
+			before := vm.GetMetric(t, "vm_memory_intensive_queries_total")
+			res := vm.PrometheusAPIV1QueryRange(t, "max by (pod) (logged_groups)", opts)
+			if tt.wantError {
+				if res.ErrorType != "422" || !strings.Contains(res.Error, "-search.maxMemoryPerQuery") {
+					t.Fatalf("expected memory limit error; got %+v", res)
+				}
+			} else if res.Status != "success" || len(res.Data.Result) != seriesCount || len(res.Data.Result[0].Samples) != pointsCount {
+				t.Fatalf("unexpected grouped aggregation result: %+v", res)
+			}
+			// /metrics caches its response for one second, including the scrape above.
+			time.Sleep(1100 * time.Millisecond)
+			if got := vm.GetMetric(t, "vm_memory_intensive_queries_total") - before; got != tt.wantLogged {
+				t.Fatalf("unexpected memory-intensive query count: got %g; want %g", got, tt.wantLogged)
+			}
+		})
+	}
+}
 
 func TestClusterMaxUniqueTimeseries(t *testing.T) {
 	fs.MustRemoveDir(t.Name())

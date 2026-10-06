@@ -5,12 +5,118 @@ import (
 	"math"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
 	"github.com/VictoriaMetrics/metricsql"
 )
+
+func TestIncrementalAggrMemoryLimits(t *testing.T) {
+	newTS := func(pod string) *timeseries {
+		ts := &timeseries{Values: make([]float64, 32)}
+		ts.MetricName.AddTag("pod", pod)
+		return ts
+	}
+	for _, limit := range []string{"query", "concurrent"} {
+		t.Run(limit, func(t *testing.T) {
+			expr, err := metricsql.Parse("max by (pod) (x)")
+			if err != nil {
+				t.Fatal(err)
+			}
+			iafc := newIncrementalAggrFuncContext(expr.(*metricsql.AggrFuncExpr), getIncrementalAggrFuncCallbacks("max"))
+			iafc.memoryLimiter.MaxSize = 3000
+			global := &memoryLimiter{MaxSize: 100000}
+			if limit == "concurrent" {
+				iafc.memoryLimiter.MaxSize, global.MaxSize = global.MaxSize, iafc.memoryLimiter.MaxSize
+			}
+			iafc.rollupMemoryLimiter = global
+			if err := iafc.updateTimeseries(newTS("a"), 0); err != nil {
+				t.Fatal(err)
+			}
+			usage := global.usage
+			for range 100 {
+				if err := iafc.updateTimeseries(newTS("a"), 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if global.usage != usage || iafc.memoryLimiter.usage != usage {
+				t.Fatal("repeated group consumed additional memory")
+			}
+			if err := iafc.updateTimeseries(newTS("b"), 0); err == nil {
+				t.Fatal("expected memory limit error for a new group")
+			}
+			if len(iafc.byWorkerID[0].m) != 1 || global.usage != usage || iafc.memoryLimiter.usage != usage {
+				t.Fatal("rejected group allocated state or leaked a reservation")
+			}
+			iafc.resetState()
+			if global.usage != 0 || iafc.memoryLimiter.usage != 0 || iafc.byWorkerID[0].m != nil {
+				t.Fatal("memory not released after failure")
+			}
+			if err := iafc.updateTimeseries(newTS("a"), 0); err != nil {
+				t.Fatal(err)
+			}
+			iafc.finalizeTimeseries()
+			iafc.resetState()
+			if global.usage != 0 || iafc.memoryLimiter.usage != 0 {
+				t.Fatal("memory not released after success")
+			}
+		})
+	}
+
+	t.Run("workers", func(t *testing.T) {
+		expr, err := metricsql.Parse("max by (pod) (x)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		iafc := newIncrementalAggrFuncContext(expr.(*metricsql.AggrFuncExpr), getIncrementalAggrFuncCallbacks("max"))
+		iafc.byWorkerID = make([]incrementalAggrContextMap, 4)
+		iafc.memoryLimiter.MaxSize = 3000
+		iafc.rollupMemoryLimiter = &memoryLimiter{MaxSize: 100000}
+		var wg sync.WaitGroup
+		errs := make(chan error, 4)
+		for workerID := range 4 {
+			wg.Go(func() {
+				errs <- iafc.updateTimeseries(newTS("a"), uint(workerID))
+			})
+		}
+		wg.Wait()
+		close(errs)
+		successes := 0
+		for err := range errs {
+			if err == nil {
+				successes++
+			}
+		}
+		if successes != 1 {
+			t.Fatalf("worker-local copies must share the query budget; successful allocations: %d; want 1", successes)
+		}
+		iafc.resetState()
+		if iafc.memoryLimiter.usage != 0 || iafc.rollupMemoryLimiter.usage != 0 {
+			t.Fatal("memory not released after concurrent failure")
+		}
+	})
+
+	t.Run("any", func(t *testing.T) {
+		expr, err := metricsql.Parse("any by (pod) (x)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		iafc := newIncrementalAggrFuncContext(expr.(*metricsql.AggrFuncExpr), getIncrementalAggrFuncCallbacks("any"))
+		iafc.memoryLimiter.MaxSize = 3000
+		iafc.rollupMemoryLimiter = &memoryLimiter{MaxSize: 100000}
+		ts := newTS("a")
+		ts.MetricName.AddTag("long_label", strings.Repeat("x", 3000))
+		if err := iafc.updateTimeseries(ts, 0); err == nil {
+			t.Fatal("expected memory limit error for the original labels retained by any")
+		}
+		if len(iafc.byWorkerID[0].m) != 0 || iafc.memoryLimiter.usage != 0 || iafc.rollupMemoryLimiter.usage != 0 {
+			t.Fatal("rejected group allocated state")
+		}
+		iafc.resetState()
+	})
+}
 
 func TestIncrementalAggr(t *testing.T) {
 	defaultTimestamps := []int64{100e3, 200e3, 300e3, 400e3}
@@ -100,6 +206,7 @@ func TestIncrementalAggr(t *testing.T) {
 }
 
 func testIncrementalParallelAggr(iafc *incrementalAggrFuncContext, tssSrc, tssExpected []*timeseries) error {
+	defer iafc.resetState()
 	workersCount := netstorage.MaxWorkers()
 	tsCh := make(chan *timeseries)
 	var wg sync.WaitGroup
@@ -107,7 +214,9 @@ func testIncrementalParallelAggr(iafc *incrementalAggrFuncContext, tssSrc, tssEx
 		wg.Go(func() {
 			for ts := range tsCh {
 				runtime.Gosched() // allow other goroutines performing the work
-				iafc.updateTimeseries(ts, uint(workerID))
+				if err := iafc.updateTimeseries(ts, uint(workerID)); err != nil {
+					panic(err)
+				}
 			}
 		})
 	}

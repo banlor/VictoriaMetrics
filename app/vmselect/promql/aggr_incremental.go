@@ -1,6 +1,7 @@
 package promql
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"unsafe"
@@ -78,12 +79,20 @@ type incrementalAggrFuncContext struct {
 	byWorkerID []incrementalAggrContextMap
 
 	callbacks *incrementalAggrFuncCallbacks
+
+	// Account for every worker-local group before allocating its state.
+	memoryLimiter       memoryLimiter
+	rollupMemoryLimiter *memoryLimiter
 }
 
 func (iafc *incrementalAggrFuncContext) resetState() {
 	byWorkerID := iafc.byWorkerID
 	for i := range byWorkerID {
-		byWorkerID[i].m = make(map[string]*incrementalAggrContext, len(byWorkerID[i].m))
+		byWorkerID[i].m = nil
+	}
+	if iafc.rollupMemoryLimiter != nil {
+		iafc.rollupMemoryLimiter.Put(iafc.memoryLimiter.usage)
+		iafc.memoryLimiter.Put(iafc.memoryLimiter.usage)
 	}
 }
 
@@ -95,7 +104,7 @@ func newIncrementalAggrFuncContext(ae *metricsql.AggrFuncExpr, callbacks *increm
 	}
 }
 
-func (iafc *incrementalAggrFuncContext) updateTimeseries(tsOrig *timeseries, workerID uint) {
+func (iafc *incrementalAggrFuncContext) updateTimeseries(tsOrig *timeseries, workerID uint) error {
 	v := &iafc.byWorkerID[workerID]
 	if v.m == nil {
 		v.m = make(map[string]*incrementalAggrContext, 1)
@@ -117,15 +126,35 @@ func (iafc *incrementalAggrFuncContext) updateTimeseries(tsOrig *timeseries, wor
 	if iac == nil {
 		if iafc.ae.Limit > 0 && len(m) >= iafc.ae.Limit {
 			// Skip this time series, since the limit on the number of output time series has been already reached.
-			return
+			bbPool.Put(bb)
+			return nil
+		}
+		if keepOriginal {
+			ts = tsOrig
+		}
+		if iafc.rollupMemoryLimiter != nil {
+			// Two float64 arrays, the map entry and the copied metric name.
+			// Timestamps are shared with the rollup and already accounted for.
+			memorySize := uint64(len(ts.Values))*16 + 1000 + uint64(len(k)+len(ts.MetricName.MetricGroup))
+			for _, tag := range ts.MetricName.Tags {
+				memorySize += uint64(unsafe.Sizeof(tag)) + uint64(len(tag.Key)+len(tag.Value))
+			}
+			if !iafc.memoryLimiter.Get(memorySize) {
+				bbPool.Put(bb)
+				return fmt.Errorf("not enough memory for incremental aggregation %s according to -search.maxMemoryPerQuery; memory budget for groups: %d bytes; requested memory for a new group: %d bytes",
+					iafc.ae.AppendString(nil), iafc.memoryLimiter.MaxSize, memorySize)
+			}
+			if !iafc.rollupMemoryLimiter.Get(memorySize) {
+				iafc.memoryLimiter.Put(memorySize)
+				bbPool.Put(bb)
+				return fmt.Errorf("not enough memory for incremental aggregation %s; total available memory for concurrent requests: %d bytes; requested memory for a new group: %d bytes",
+					iafc.ae.AppendString(nil), iafc.rollupMemoryLimiter.MaxSize, memorySize)
+			}
 		}
 		tsAggr := &timeseries{
 			Values:     make([]float64, len(ts.Values)),
 			Timestamps: ts.Timestamps,
 			denyReuse:  true,
-		}
-		if keepOriginal {
-			ts = tsOrig
 		}
 		tsAggr.MetricName.CopyFrom(&ts.MetricName)
 		iac = &incrementalAggrContext{
@@ -136,6 +165,7 @@ func (iafc *incrementalAggrFuncContext) updateTimeseries(tsOrig *timeseries, wor
 	}
 	bbPool.Put(bb)
 	iafc.callbacks.updateAggrFunc(iac, ts.Values)
+	return nil
 }
 
 func (iafc *incrementalAggrFuncContext) finalizeTimeseries() []*timeseries {
@@ -162,8 +192,6 @@ func (iafc *incrementalAggrFuncContext) finalizeTimeseries() []*timeseries {
 		finalizeAggrFunc(iac)
 		tss = append(tss, iac.ts)
 	}
-	// reset iafc state, so it could be reused
-	iafc.resetState()
 	return tss
 }
 
